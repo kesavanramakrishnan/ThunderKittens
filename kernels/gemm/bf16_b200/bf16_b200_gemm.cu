@@ -64,15 +64,15 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
     using G = globals<C>;
 
     if (threadIdx.x == 0) {
-        g.a.template prefetch_tma<typename G::a_tile>();
+        g.a.template prefetch_tma<typename G::a_tile>(); // prefetch tensor maps at start of kernel 
         g.b.template prefetch_tma<typename G::b_tile>();
         g.d.template prefetch_tma<typename G::d_tile>();
     }
 
-    const int cta_rank = cluster_ctarank();
-    const int iters_per_task = g.a.cols() / C::Kb;
-    const int rblks = g.d.rows() / (C::Mb * C::NUM_CONSUMERS);
-    const int cblks = g.d.cols() / C::Nb;
+    const int cta_rank = cluster_ctarank(); // get the cta rank (launch threadblock clusters of 2?)
+    const int iters_per_task = g.a.cols() / C::Kb; // number of iterations of mma_AB per task
+    const int rblks = g.d.rows() / (C::Mb * C::NUM_CONSUMERS); // number of rows of blocks
+    const int cblks = g.d.cols() / C::Nb; // number of columns of blocks
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);

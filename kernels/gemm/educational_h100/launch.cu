@@ -120,6 +120,16 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Error count: " << error_count << std::endl;
     std::cout << "Total count: " << int(N * N) << std::endl;
 
+    // Save inputs and outputs to binary files for torch comparison
+    {
+        FILE *f;
+        f = fopen("/tmp/gemm_A.bin", "wb"); fwrite(h_A_bf16, 2, M*K, f); fclose(f);
+        f = fopen("/tmp/gemm_B.bin", "wb"); fwrite(h_B_bf16, 2, K*N, f); fclose(f);
+        f = fopen("/tmp/gemm_C_kernel.bin", "wb"); fwrite(h_C_bf16, 2, M*N, f); fclose(f);
+        f = fopen("/tmp/gemm_C_ref.bin", "wb"); fwrite(h_C_ref_bf16, 2, M*N, f); fclose(f);
+        std::cout << "Saved binary files to /tmp/gemm_*.bin for torch comparison" << std::endl;
+    }
+
     // Clean up
     delete[] h_A;
     delete[] h_B;
@@ -139,7 +149,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
 int main() {
     int N;
-    N = 4096;
+    N = 8192;
     run_benchmark(N, N, N);
     return 0;
 }

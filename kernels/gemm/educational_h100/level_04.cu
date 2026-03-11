@@ -43,9 +43,9 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         __syncthreads();
         kittens::warp::load(A_reg, As);
         kittens::warp::load(B_reg, Bs);
-        kittens::warp::swap_layout(B_reg_col, B_reg);
+        // kittens::warp::swap_layout(B_reg_col, B_reg);
         __syncthreads();
-        kittens::warp::mma_AB(C_accum, A_reg, B_reg_col, C_accum);
+        kittens::warp::mma_ABt(C_accum, A_reg, B_reg, C_accum);
         __syncthreads(); 
     }
     kittens::warp::store(g.C, C_accum, {0, 0, row, col});

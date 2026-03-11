@@ -61,7 +61,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     }
     __syncthreads();
 
-    // __shared__ semaphore bar;
     if (is_producer) {
         warpgroup::decrease_registers<40>();
         if (warpgroup::laneid() == 0) {
