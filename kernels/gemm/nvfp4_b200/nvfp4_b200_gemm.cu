@@ -673,16 +673,17 @@ __host__ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
     LaunchConfig<true, true> launch_config(g[0].grid(), g[0].block(), g[0].dynamic_shared_memory(), 0, C::CLUSTER_SIZE);
 
     // Number of iterations
-    int num_warmups = ncu ? 0 : 5;
-    int num_iters = ncu ? 1 : 10;
+    int num_warmups = ncu ? 0 : 500;
+    int num_iters = ncu ? 1 : 100;
 
-    // Warmup
+    // Warmup (reach power-steady state)
     for (int i = 0; i < num_warmups; i++) {
         int idx = i % arg_group_count;
         cudaLaunchKernelEx(launch_config, kernel_entrypoint<C>, g[idx]);
     }
+    cudaDeviceSynchronize();
 
-    // Benchmark
+    // Benchmark (back-to-back, 2 events)
     cudaEvent_t start, stop;
     CUDACHECK(cudaEventCreate(&start));
     CUDACHECK(cudaEventCreate(&stop));
