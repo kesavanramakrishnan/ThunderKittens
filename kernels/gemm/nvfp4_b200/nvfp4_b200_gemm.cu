@@ -126,6 +126,7 @@ __device__ inline void kernel(const globals<C> &g) {
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
+    __shared__ semaphore tmem_dealloc_ready;
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -136,6 +137,7 @@ __device__ inline void kernel(const globals<C> &g) {
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
+        init_semaphore(tmem_dealloc_ready, 0, C::CLUSTER_SIZE);
     }
     everyone::tma::cluster::arrive_aligned();
 
@@ -297,7 +299,12 @@ __device__ inline void kernel(const globals<C> &g) {
         }
         warpgroup::sync(1);
         warpgroup::pdl::arrive();
-        if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        if (warpgroup::warpid() == 0) {
+            warpgroup::tma::cluster::arrive(tmem_dealloc_ready, 0, 1);
+            warpgroup::tma::cluster::arrive(tmem_dealloc_ready, 1, 1);
+            tma::cluster::wait(tmem_dealloc_ready, 0);
+            tm_allocator.deprovision();
+        }
     }
 }
 
