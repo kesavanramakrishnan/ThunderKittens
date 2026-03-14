@@ -84,7 +84,7 @@ def parse_results(output):
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="B200",
     timeout=1800,
 )
 def run_level(level: str):
@@ -110,7 +110,7 @@ def run_level(level: str):
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="B200",
     timeout=3600,
 )
 def run_all_levels(levels: list[str]):
