@@ -49,17 +49,18 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     //    __shared__ semaphore tmem_provisioned;
 
     using G = matmul_globals;
-
+    // Prefetch TMA descriptors
     if (threadIdx.x == 0) {
-        g.a.template prefetch_tma<typename G::a_tile>(); // prefetch tensor maps at start of kernel 
-        g.b.template prefetch_tma<typename G::b_tile>();
-        g.d.template prefetch_tma<typename G::d_tile>();
+        g.A.template prefetch_tma<typename G::a_tile>();
+        g.B.template prefetch_tma<typename G::b_tile>();
+        g.D.template prefetch_tma<typename G::d_tile>();
     }
 
-    const int iters_per_task = g.a.cols() / BK; // number of iterations of mma_AB per task
-    const int rblks = g.d.rows() / BM;
-    const int cblks = g.d.cols() / BN;
+    const int num_k_tiles = g.A.cols() / BK;
+    int row = blockIdx.y;
+    int col = blockIdx.x;
 
+    // Shared memory allocation
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
 
@@ -67,62 +68,82 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     typename G::b_tile (&b_smem) = al.allocate<G::b_tile>();
     typename G::d_tile (&d_smem) = al.allocate<G::d_tile>();
 
+    // TMEM allocation
     tensor_allocator<1, 1, false> tm_alloc{};
     using d_tt_t = tt<float, BM, BN>;
 
     __shared__ uint32_t tmem_addr;
-    __shared__ semaphore tmem_provisioned;
-    int tile_coord_row = blockIdx.x;
-    int tile_coord_col = blockIdx.y;
+    __shared__ semaphore inputs_arrived, inputs_finished, outputs_arrived;
 
-    //
-    // 2. Epilogue warpgroup provisions TMEM:
-    //    tm_alloc.provision(tmem_addr);
-    //    warp::arrive(tmem_provisioned);
-
-    if (threadIdx.x == 32) {
-        init_semaphore(tmem_provisioned, 0, 1);
-        tm_alloc.provision(tmem_addr);
-        warp::arrive(tmem_provisioned);
+    // Initialize semaphores (single thread)
+    if (threadIdx.x == 0) {
+        init_semaphore(inputs_arrived, 0, 1);   // 1 TMA transaction group
+        init_semaphore(inputs_finished, 0, 1);  // 1 MMA signals done reading smem
+        init_semaphore(outputs_arrived, 0, 1);  // commit signals MMA results ready
     }
-
+    // Provision TMEM (entire warp 0 must participate)
+    if (warpid() == 0) {
+        tm_alloc.provision(tmem_addr);
+    }
     __syncthreads();
 
-    // TODO: Implement consumer logic
-    wait(tmem_provisioned, 0);
+    // All threads: set up allocator with the provisioned address
     tm_alloc.set_addr(tmem_addr);
-    d_tt = tm_alloc.allocate<d_tt_t>(0, 0);
+    d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
 
-    for (int k_iter = 0; k_iter < iters_per_task; k_iter++) {
+    // K-loop: TMA load then MMA (fully serial, no overlap)
+    for (int k_iter = 0; k_iter < num_k_tiles; k_iter++) {
+        // Wait for previous MMA to finish reading smem (skip first iter)
+        if (k_iter > 0) {
+            wait(inputs_finished, (k_iter - 1) % 2);
+        }
+
+        // TMA load (single thread only)
         if (warpgroup::warpid() == 0 && warp::elect_leader()) {
-            tma::cluster::load_async(a_smem, g.a, {tile_coord_row, idx});
-            wait(inputs_arrived)
+            tma::expect_bytes(
+                inputs_arrived,
+                size_bytes<typeof(a_smem)> +
+                size_bytes<typeof(b_smem)>
+            );
+            tma::load_async(a_smem, g.A, {0, 0, row, k_iter}, inputs_arrived);
+            tma::load_async(b_smem, g.B, {0, 0, col, k_iter}, inputs_arrived);
+        
+        wait(inputs_arrived, k_iter % 2);
+
+        // MMA: shared -> TMEM (single thread for tcgen05)
+        // sem version: signals inputs_finished when MMA is done reading smem
+        // if (warpgroup::warpid() == 0 && warp::elect_leader()) {
+            if (k_iter == 0) mm_ABt(d_tt, a_smem, b_smem, inputs_finished);
+            else             mma_ABt(d_tt, a_smem, b_smem, inputs_finished);
         }
     }
 
+    // Commit: flush MMA pipeline, signal outputs_arrived when TMEM is ready
+    if (threadIdx.x == 0) {
+        detail::tcgen05::commit<1>(outputs_arrived);
+    }
+    wait(outputs_arrived, 0);
 
+    // Epilogue: TMEM -> registers -> shared -> global
+    rt_bf<BM/4, BN> d_reg;
+    warpgroup::load_async(d_reg, d_tt);
+    tensor_load_wait();
+    warpgroup::store(d_smem, d_reg);
+    warpgroup::sync(1);
+    if (warpgroup::laneid() == 0) {
+        tma::store_async(g.D, d_smem, {0, 0, row, col});
+        tma::store_async_read_wait();
+    }
 
-    //
-    // 3. Consumer warpgroup (CTA rank 0 only for tcgen05):
-    //    - wait(tmem_provisioned)
-    //    - d_tt = tm_alloc.allocate<d_tt_t>(...)
-    //    - K-loop: mm2_ABt (idx==0) / mma2_ABt (idx>0) instead of warpgroup::mma_ABt
-    //    - detail::tcgen05::commit<1>(outputs_arrived) to signal completion
-    //
-    // 4. Epilogue warpgroup:
-    //    - wait(outputs_arrived)
-    //    - warpgroup::load_async(d_reg, d_tt)  // TMEM -> registers (auto bf16 convert)
-    //    - tensor_load_wait()
-    //    - warpgroup::store(d_smem, d_reg)      // registers -> SMEM
-    //    - warpgroup::tma::store_async(...)      // SMEM -> global
-    //    - arrive(outputs_finished)
-    //    - tm_alloc.deprovision()
+    // Free TMEM (entire warp must participate)
+    warpgroup::sync(1);
+    if (warpid() == 0) tm_alloc.deprovision();
 }
 
 void matmul(bf16* A, bf16* B, bf16* C, size_t M, size_t N, size_t K) {
-    matmul_globals::a_gl a_arg{A, nullptr, nullptr, (int)M, (int)K};
-    matmul_globals::b_gl b_arg{B, nullptr, nullptr, (int)N, (int)K};
-    matmul_globals::d_gl d_arg{C, nullptr, nullptr, (int)M, (int)N};
+    matmul_globals::a_gl a_arg{A, nullptr, nullptr, M, K};
+    matmul_globals::b_gl b_arg{B, nullptr, nullptr, N, K};
+    matmul_globals::d_gl d_arg{C, nullptr, nullptr, M, N};
     matmul_globals g{a_arg, b_arg, d_arg};
 
     dim3 grid(N / BN, M / BM);
