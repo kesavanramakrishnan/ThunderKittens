@@ -22,7 +22,7 @@ using namespace kittens;
 static constexpr int BM = 256;
 static constexpr int BN = 128;
 static constexpr int BK = 64;
-static constexpr int QSIZE = 4;
+static constexpr int QSIZE = 2;
 static constexpr int CLUSTER_SIZE = 2;
 
 static constexpr int NUM_CONSUMER_WARPGROUPS = 1;  // MMA only
