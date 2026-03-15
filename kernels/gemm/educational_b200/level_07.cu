@@ -1,42 +1,11 @@
 // Level 07: Epilogue Pipelining
-// ================================
-// Builds on Level 06 (naive persistent kernel with strided tile assignment).
-// Instead of storing the entire 128×128 output tile at once, split the
-// N-dimension into EPI_PIPE_DEPTH chunks and pipeline the stores.
+// Split epilogue stores into EPI_PIPE_DEPTH chunks along N, double-buffer SMEM.
 //
-// Why this helps:
-//   - The epilogue does: TMEM → registers → SMEM → TMA store (global)
-//   - With EPI_PIPE_DEPTH=1 (Level 06), the full 128×128 tile must complete
-//     the entire TMEM→reg→smem→global chain before TMEM is freed
-//   - With EPI_PIPE_DEPTH>1, we read a smaller chunk from TMEM, and can
-//     overlap the smem→global store of chunk i with the TMEM read of chunk i+1
-//   - TMEM is freed after ALL chunks are read (not after each chunk)
+// New: EPI_PIPE_DEPTH chunked stores, d_tt.subtile for partial TMEM reads,
+//      NUM_D_TILES=2 output SMEM double buffering, store_async_read_wait,
+//      outputs_finished after last chunk (not each)
 //
-// New concepts (vs Level 06):
-//   - EPI_PIPE_DEPTH: number of chunks along N dimension (e.g., 4 or 8)
-//   - d_tile = st_bf<BM/2, BN/EPI_PIPE_DEPTH> — smaller output SMEM tiles
-//   - NUM_D_TILES = EPI_PIPE_DEPTH > 1 ? 2 : 1 — double-buffer output SMEM
-//     * With 2 SMEM tiles, we can be writing chunk i to global while filling
-//       chunk i+1 from registers
-//   - d_tt.subtile<tt<float, BM/2, BN/EPI_PIPE_DEPTH>>(0, offset) to read
-//     a slice of the full TMEM accumulator
-//   - store_async_read_wait<NUM_D_TILES-1> to wait for prior TMA stores
-//     before reusing the SMEM double buffer slot
-//   - outputs_finished signals after the LAST chunk's TMEM read, not after
-//     each chunk — TMEM must stay valid for all chunk reads
-//
-// Epilogue loop structure:
-//   for (int i = 0; i < EPI_PIPE_DEPTH; i++):
-//     if (i == EPI_PIPE_DEPTH - 1):
-//       signal outputs_finished  // TMEM fully read, safe for next tile's MMA
-//     store_async_read_wait<NUM_D_TILES-1>  // wait for prior TMA store to free smem slot
-//     load_async(d_reg, d_tt.subtile(0, BN/EPI_PIPE_DEPTH * i))  // TMEM → reg
-//     tensor_load_wait()
-//     store(d_smem[i % NUM_D_TILES], d_reg)  // reg → smem
-//     store_async(g.D, d_smem[i % NUM_D_TILES], coords)  // smem → global
-//
-// Tile: 256x128 output per cluster, CLUSTER_SIZE=2
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 256×128 per cluster, CLUSTER_SIZE=2
 
 #include "kittens.cuh"
 using namespace kittens;

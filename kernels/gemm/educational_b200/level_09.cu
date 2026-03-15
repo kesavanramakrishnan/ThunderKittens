@@ -1,50 +1,13 @@
 // Level 09: CLC (Cluster Launch Control)
-// =========================================
-// Builds on Level 08 (MMA pipeline depth + epilogue pipelining).
-// Replaces the strided tile loop with hardware-scheduled persistent
-// execution via CLC — the GPU's built-in work distribution mechanism.
+// Hardware-scheduled persistent execution replaces strided tile loops.
 //
-// Why CLC instead of strided loops:
-//   - Strided assignment is static — can't adapt to runtime load imbalance
-//   - CLC dynamically assigns tiles to clusters as they become available
-//   - CLC handles the "persistent kernel" pattern in hardware, so we don't
-//     need to manage a global atomic counter or stride calculation
-//   - CLC also enables dependent kernel launches for back-to-back matmuls
+// New: clc::handle/schedule/query for HW work distribution,
+//      schedule_arrived/finished semaphore pipeline (CLC_PIPE_DEPTH),
+//      producer warp 2 = CLC scheduler, warp 3 = TMA loader,
+//      all warpgroups participate in CLC protocol,
+//      LaunchConfig<true, true> for cluster + CLC
 //
-// New concepts (vs Level 08):
-//   - clc::handle: shared memory object that receives scheduling info from HW
-//   - clc::schedule(handle, sem): CTA 0 requests next tile from HW scheduler
-//   - clc::query(handle): all CTAs read the assigned tile index
-//     * Returns {success, x} — success=false means no more tiles
-//   - schedule_arrived[CLC_PIPE_DEPTH]: HW signals when a new tile is assigned
-//   - schedule_finished[CLC_PIPE_DEPTH]: kernel signals when done processing
-//     * Arrival count = (2 + NUM_CONSUMER_WARPGROUPS) * CLUSTER_SIZE + NUM_CONSUMER_WARPGROUPS
-//       because producer (2 warps: loader + scheduler), consumer(s), and
-//       epilogue all need to acknowledge the schedule
-//   - LaunchConfig<true, true>: cluster=true, CLC=true
-//   - Grid size = total_tiles * CLUSTER_SIZE (HW schedules all tiles)
-//
-// Producer warpgroup now has 2 active warps:
-//   - Warp 3: TMA loader (same K-loop as before, but inside CLC task loop)
-//     * After K-loop, waits on schedule_arrived to get NEXT tile index
-//     * Queries clc::handle for tile coords
-//     * Signals schedule_finished when done reading handle
-//     * Breaks when schedule.success == false
-//   - Warp 2: CLC scheduler
-//     * CTA 0 only: calls clc::schedule to request next tile
-//     * Waits on schedule_finished (previous tile fully acknowledged)
-//     * All CTAs: waits on schedule_arrived, queries handle, signals finished
-//     * Breaks when schedule.success == false
-//
-// Consumer and epilogue also participate in CLC protocol:
-//   - Both wait on schedule_arrived to get tile index
-//   - Both signal schedule_finished after reading the handle
-// Key structural change: the task loop is now `for (task_iter = 0; true; ...)`
-// with a `break` when `!schedule.success`, instead of iterating over a
-// known tile count with stride.
-//
-// Tile: 256x256 output per cluster, CLUSTER_SIZE=2
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 256×256 per cluster, CLUSTER_SIZE=2
 
 #include "kittens.cuh"
 using namespace kittens;

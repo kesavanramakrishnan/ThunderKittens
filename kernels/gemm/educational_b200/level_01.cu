@@ -1,17 +1,10 @@
-// Level 01: H100-style baseline on B200
-// =======================================
-// WGMMA + TMA + producer/consumer warpgroup split + double buffering.
-// No B200-specific features yet — just a working matmul using H100-era patterns.
+// Level 01: H100-Style Baseline
+// WGMMA + TMA + producer/consumer split + double buffering. No B200 features.
 //
-// Concepts:
-//   - warpgroup::mma_ABt (WGMMA on shared memory tiles)
-//   - TMA loads with tma::load_async
-//   - Producer/consumer warpgroup partitioning
-//   - Semaphore-based synchronization (full/empty)
-//   - Double buffering (QSIZE=2) to overlap loads with compute
+// New: warpgroup::mma_ABt, tma::load_async, producer/consumer warpgroups,
+//      semaphore sync (full/empty), double buffering (QSIZE=2)
 //
-// Tile: 64x256 output per CTA, single warpgroup consumer
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 64×256, 1 CTA
 
 #include "kittens.cuh"
 using namespace kittens;

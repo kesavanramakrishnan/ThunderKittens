@@ -1,41 +1,12 @@
 // Level 08: MMA Pipeline Depth
-// ================================
-// Builds on Level 07 (epilogue pipelining + naive persistent kernel).
-// Adds MMA_PIPE_DEPTH=2 to double-buffer TMEM accumulators, allowing
-// the consumer to start the next tile's MMA while the epilogue is still
-// reading/storing the current tile's results.
+// Double-buffer TMEM accumulators so consumer can MMA tile N+1 while
+// epilogue stores tile N.
 //
-// Why this helps:
-//   - In Level 07, the consumer must wait for outputs_finished before
-//     starting MMA for the next tile — TMEM is occupied by the epilogue
-//   - With MMA_PIPE_DEPTH=2, two TMEM accumulators alternate:
-//     * Consumer writes tile N into d_tt[0], commits
-//     * Consumer immediately starts tile N+1 into d_tt[1] (no wait!)
-//     * Epilogue reads d_tt[0] concurrently with tile N+1's MMA
-//     * Consumer waits for d_tt[0]'s epilogue only before tile N+2
+// New: MMA_PIPE_DEPTH=2, d_tt[MMA_PIPE_DEPTH] at separate TMEM offsets,
+//      outputs_arrived/finished arrayed per accumulator,
+//      task_iter-based phase formulas for MMA pipeline semaphores
 //
-// New concepts (vs Level 07):
-//   - MMA_PIPE_DEPTH = 2: number of TMEM accumulators
-//   - d_tt[MMA_PIPE_DEPTH]: array of accumulators at different TMEM offsets
-//     * d_tt[i] = tm_alloc.allocate<d_tt_t>(i * BN)
-//   - outputs_finished[MMA_PIPE_DEPTH]: one semaphore per accumulator
-//   - outputs_arrived[MMA_PIPE_DEPTH]: one semaphore per accumulator
-//   - Consumer uses d_tt[task_iter % MMA_PIPE_DEPTH]
-//   - Consumer waits on outputs_finished[task_iter % MMA_PIPE_DEPTH]
-//     (first MMA_PIPE_DEPTH tiles pass immediately via bitfield)
-//   - Epilogue reads d_tt[task_iter % MMA_PIPE_DEPTH] in chunks
-//   - Epilogue signals outputs_finished[task_iter % MMA_PIPE_DEPTH]
-//     after the last chunk is read from that accumulator
-//
-// Timeline with MMA_PIPE_DEPTH=2:
-//   Tile 0: MMA → d_tt[0], commit(outputs_arrived[0])
-//   Tile 1: MMA → d_tt[1], commit(outputs_arrived[1])  ← no wait!
-//           Epilogue reads d_tt[0], signals outputs_finished[0]
-//   Tile 2: wait(outputs_finished[0]), MMA → d_tt[0]
-//           Epilogue reads d_tt[1], signals outputs_finished[1]
-//
-// Tile: 256x256 output per cluster, CLUSTER_SIZE=2
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 256×256 per cluster, CLUSTER_SIZE=2
 
 #include "kittens.cuh"
 using namespace kittens;

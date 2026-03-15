@@ -1,56 +1,12 @@
-// Level 10: Full Production Kernel
-// ====================================
-// The complete optimized B200 matmul kernel matching bf16_b200_gemm.cu.
-// Adds supergroup swizzling, OVERLAP_MMA_EPI mode, configurable template
-// parameters, and NUM_CONSUMERS=2 non-overlap mode.
+// Level 10: Full Production Kernel (≡ bf16_b200_gemm.cu)
+// Fully templated kernel with all optimizations combined.
 //
-// New concepts (vs Level 09):
+// New: supergroup swizzling (L2 cache), OVERLAP_MMA_EPI mode (1 warpgroup
+//      does both MMA + epilogue), NUM_CONSUMERS=2 non-overlap mode,
+//      templated config struct, per-consumer A-tile loads,
+//      multi-accumulator TMEM allocation
 //
-// 1. Supergroup swizzling (L2 cache optimization):
-//   - get_swizzled_2d_idx<SUPERGROUP_SIZE>(rblks, cblks, cluster_idx)
-//   - SUPERGROUP_SIZE controls how many clusters share L2-cached data
-//   - Nearby clusters in a supergroup work on adjacent tiles so they
-//     share A rows / B columns in L2 cache
-//   - Applied to both initial tile coord and CLC-assigned tile coords
-//
-// 2. OVERLAP_MMA_EPI mode:
-//   - Single warpgroup handles BOTH MMA (consumer) and epilogue (store)
-//   - NUM_CONSUMERS=1, but MMA_PIPE_DEPTH=2 (double-buffer accumulators)
-//   - While epilogue stores tile N, consumer starts MMA for tile N+1
-//     into the other accumulator — true compute/store overlap
-//   - Only 2 warpgroups total: 1 producer + 1 consumer/epilogue
-//   - Epilogue reads TMEM chunk-by-chunk interleaved with stores
-//
-// 3. Non-overlap mode (NUM_CONSUMERS=2):
-//   - 2 separate consumer warpgroups each do half the MMA work
-//   - Each consumer processes a different A-tile row
-//   - MMA_PIPE_DEPTH=1 (single accumulator per consumer)
-//   - Separate epilogue warpgroup(s) with increased registers
-//   - epilogue_group = group<WARPGROUP_WARPS * NUM_CONSUMERS>
-//     aggregates all epilogue threads for sync
-//
-// 4. Fully templated config struct:
-//   - Mb, Nb, Kb: tile dimensions (Mb always 256)
-//   - SUPERGROUP_SIZE: L2 swizzle group size
-//   - OVERLAP_MMA_EPI: overlap mode toggle
-//   - LOAD_PIPE_DEPTH: input pipeline depth
-//   - EPI_PIPE_DEPTH: output pipeline depth
-//   - Derived: MMA_PIPE_DEPTH, NUM_CONSUMERS, NUM_D_TILES, CLC_PIPE_DEPTH
-//
-// 5. Multiple A-tile loads per consumer:
-//   - a_smem[LOAD_PIPE_DEPTH][NUM_CONSUMERS] — separate A tiles per consumer
-//   - B tiles shared: b_smem[LOAD_PIPE_DEPTH]
-//   - Producer loads NUM_CONSUMERS A-tiles per K iteration
-//
-// 6. TMEM allocation with multiple accumulators:
-//   - d_tt[MMA_PIPE_DEPTH] — one or two accumulators
-//   - Allocated at different TMEM offsets:
-//     (i + warpgroup_id) * Nb for Mb=256
-//
-// This is equivalent to bf16_b200_gemm.cu — the production matmul kernel.
-//
-// Tile: 256xNb output per cluster, CLUSTER_SIZE=2, fully parameterized
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 256×Nb per cluster, CLUSTER_SIZE=2, fully parameterized
 
 #include "kittens.cuh"
 #include "../common.cuh"

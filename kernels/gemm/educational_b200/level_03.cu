@@ -1,20 +1,11 @@
 // Level 03: 2-CTA Clusters + Distributed Shared Memory (DSMEM)
-// ==============================================================
-// Launch with CLUSTER_SIZE=2. Each CTA holds half A (different rows) and
-// half B (multicast — same data in both CTAs). mm2_ABt (ncta=2) reads
-// from both CTAs' shared memory via DSMEM.
+// CLUSTER_SIZE=2. MMA reads both CTAs' SMEM via DSMEM.
 //
-// New concepts:
-//   - cluster_ctarank() to identify CTA 0 vs CTA 1
-//   - tma::cluster::load_async with multicast mask for B
-//   - tma::cluster::expect_bytes at cluster scope
-//   - mm2_ABt / mma2_ABt (ncta=2) — MMA reads A and B from both CTAs
-//   - tensor_allocator<1, CLUSTER_SIZE, false> for cluster-aware TMEM
-//   - Cluster barrier for synchronization across CTAs
+// New: cluster_ctarank(), tma::cluster::load_async with multicast,
+//      mm2_ABt/mma2_ABt (ncta=2), cluster-aware tensor_allocator,
+//      cluster barrier sync
 //
-// Per-CTA tiles: A is 128×64, B is 64×64 (half each), D is 128×128
-// Per-cluster output: 256×128 (128 rows per CTA)
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A × Bᵀ
+// Tile: 256×128 per cluster (128×128 per CTA), CLUSTER_SIZE=2
 
 #include "kittens.cuh"
 using namespace kittens;

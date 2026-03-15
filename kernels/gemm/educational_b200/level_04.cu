@@ -1,20 +1,11 @@
 // Level 04: Separate Epilogue Warpgroup + Double Buffering
-// ==========================================================
-// Split the CTA into 3 roles: producer (loads), consumer (MMA), epilogue (stores).
-// The consumer writes MMA results to TMEM, the epilogue reads TMEM and stores to
-// global memory. This decouples MMA from stores.
+// 3 warpgroups: producer (loads), consumer (MMA), epilogue (stores).
 //
-// New concepts (vs Level 03):
-//   - 3 warpgroups: producer (loads), consumer (MMA), epilogue (stores)
-//   - LOAD_PIPE_DEPTH=2 double-buffered input tiles
-//   - outputs_arrived: consumer signals epilogue that TMEM accumulator is ready
-//   - tmem_provisioned: epilogue signals consumer that TMEM is allocated
-//   - increase_registers / decrease_registers for register budget balancing
-//   - warpgroup::load_async from TMEM into registers
-//   - warpgroup::store from registers to SMEM, then TMA store to global
+// New: 3-way warpgroup split, LOAD_PIPE_DEPTH=2 double buffering,
+//      outputs_arrived/tmem_provisioned semaphores,
+//      increase/decrease_registers, warpgroup::load_async from TMEM
 //
-// Tile: 256x128 output per cluster (128 rows per CTA), CLUSTER_SIZE=2
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 256×128 per cluster, CLUSTER_SIZE=2
 
 #include "kittens.cuh"
 using namespace kittens;

@@ -1,21 +1,10 @@
-// Level 06: Naive Persistent Kernel (Strided Tile Assignment)
-// =============================================================
-// Builds on Level 05 (3 warpgroups, bitfield phase tracking, LOAD_PIPE_DEPTH=4).
-// Instead of one-shot execution where each cluster processes exactly one tile,
-// the kernel runs persistently — each cluster loops over tiles with a stride
-// equal to the number of clusters in the grid.
+// Level 06: Persistent Kernel (Strided Tile Assignment)
+// Each cluster loops over tiles with stride = num_clusters.
 //
-// New concepts (vs Level 05):
-//   - Persistent outer task loop: for (tile = cluster_idx; tile < total; tile += num_clusters)
-//   - Strided tile assignment — no atomics, no cross-CTA communication needed
-//   - TMEM provisioned once, reused across all tasks
-//   - outputs_finished semaphore: epilogue signals when store is done and
-//     TMEM is safe to overwrite with next task's MMA results
-//   - Semaphore phases keep advancing naturally across tasks (bitfield tracks)
-//   - Launch with fewer clusters than tiles: grid = min(total, num_SMs/2) clusters
+// New: persistent task loop, strided tile assignment, TMEM reused across tiles,
+//      outputs_finished semaphore (epilogue → producer/consumer handshake)
 //
-// Tile: 256x128 output per cluster, CLUSTER_SIZE=2
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 256×128 per cluster, CLUSTER_SIZE=2
 
 #include "kittens.cuh"
 using namespace kittens;

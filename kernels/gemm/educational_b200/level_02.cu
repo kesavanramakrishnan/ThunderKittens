@@ -1,19 +1,11 @@
 // Level 02: Tensor Memory (TMEM) + tcgen05 MMA
-// ===============================================
-// Replace register accumulators with TMEM. Use tcgen05 MMA instructions
-// (mm2_ABt / mma2_ABt) instead of warpgroup::mma_ABt.
+// Replace register accumulators with TMEM. tcgen05 MMA instead of WGMMA.
 //
-// New concepts:
-//   - tensor_allocator for TMEM allocation
-//   - tt<float, M, N> tensor tiles (accumulators live in TMEM, not registers)
-//   - mm2_ABt (first iteration: zero + multiply) vs mma2_ABt (accumulate)
-//   - tm_alloc.provision() / deprovision() lifecycle
-//   - tmem_provisioned semaphore to broadcast TMEM address
-//   - detail::tcgen05::commit to signal MMA completion
-//   - Epilogue: TMEM -> registers -> shared memory -> TMA store
+// New: tensor_allocator, tt<float,M,N> tensor tiles, mm2_ABt/mma2_ABt,
+//      provision()/deprovision(), tmem_provisioned semaphore,
+//      tcgen05::commit, epilogue: TMEM → regs → SMEM → TMA store
 //
-// Tile: 128x128 output per CTA, single warpgroup consumer
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 128×128, 1 CTA
 
 #include "kittens.cuh"
 using namespace kittens;

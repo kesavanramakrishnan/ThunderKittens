@@ -1,19 +1,10 @@
-// Level 05: Deeper Load Pipeline
-// ================================
-// Builds on Level 04 (3 warpgroups: producer/consumer/epilogue).
-// Upgrades from simple k_iter/QSIZE phase tracking to bitfield-based phase
-// tracking with ring_advance, enabling deeper pipelines (LOAD_PIPE_DEPTH=4+).
+// Level 05: Deeper Load Pipeline + Bitfield Phase Tracking
+// LOAD_PIPE_DEPTH=4 with ring buffer and bitfield-based phase management.
 //
-// New concepts (vs Level 04):
-//   - LOAD_PIPE_DEPTH > 2 ring buffer for input tiles
-//   - ring_advance<LOAD_PIPE_DEPTH>(ring_idx) to advance ring index
-//   - Bitfield phase tracking: uint32_t bitfield = 0xFFFF0000
-//     * Upper 16 bits = finished phases (start 1), lower 16 = arrived phases (start 0)
-//   - get_phasebit<bit_offset>(bitfield, ring_idx) to read current phase
-//   - update_phasebit<bit_offset>(bitfield, ring_idx) to flip phase after wait
+// New: ring_advance<DEPTH>, bitfield phase tracking (0xFFFF0000),
+//      get_phasebit/update_phasebit for scalable pipeline depths
 //
-// Tile: 256x128 output per cluster, CLUSTER_SIZE=2
-// Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
+// Tile: 256×128 per cluster, CLUSTER_SIZE=2
 
 #include "kittens.cuh"
 using namespace kittens;
