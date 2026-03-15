@@ -1,18 +1,18 @@
-// Level 06: CLC (Cluster Launch Control) — Persistent Kernel
-// ============================================================
-// Replace fixed grid-based tile assignment with CLC hardware scheduling.
-// The kernel runs persistently — each cluster requests the next tile from
-// the CLC hardware unit instead of computing it from blockIdx.
+// Level 06: Naive Persistent Kernel (Strided Tile Assignment)
+// =============================================================
+// Builds on Level 05 (3 warpgroups, bitfield phase tracking, LOAD_PIPE_DEPTH=4).
+// Instead of one-shot execution where each cluster processes exactly one tile,
+// the kernel runs persistently — each cluster loops over tiles with a stride
+// equal to the number of clusters in the grid.
 //
-// New concepts:
-//   - clc::handle for storing schedule results
-//   - clc::schedule(handle, semaphore) — ask hardware for next tile (CTA 0 only)
-//   - clc::query(handle) — read the result (schedule.success, schedule.x)
-//   - schedule_arrived / schedule_finished semaphores for CLC pipeline
-//   - tma::expect_bytes for CLC async delivery (piggybacks on TMA mbarrier)
-//   - Dedicated scheduler warp (warp 2 of producer warpgroup)
-//   - Infinite loop: for (task_iter = 0; true; task_iter++) ... break on !success
-//   - LaunchConfig<true, true> for CLC + PDL enabled launch
+// New concepts (vs Level 05):
+//   - Persistent outer task loop: for (tile = cluster_idx; tile < total; tile += num_clusters)
+//   - Strided tile assignment — no atomics, no cross-CTA communication needed
+//   - TMEM provisioned once, reused across all tasks
+//   - outputs_finished semaphore: epilogue signals when store is done and
+//     TMEM is safe to overwrite with next task's MMA results
+//   - Semaphore phases keep advancing naturally across tasks (bitfield tracks)
+//   - Launch with fewer clusters than tiles: grid = min(total, num_SMs/2) clusters
 //
 // Tile: 256x128 output per cluster, CLUSTER_SIZE=2
 // Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
@@ -24,12 +24,12 @@ static constexpr int BM = 256;
 static constexpr int BN = 128;
 static constexpr int BK = 64;
 static constexpr int LOAD_PIPE_DEPTH = 4;
-static constexpr int CLC_PIPE_DEPTH = 1;
 static constexpr int CLUSTER_SIZE = 2;
 
 static constexpr int NUM_CONSUMER_WARPGROUPS = 1;
+static constexpr int NUM_EPILOGUE_WARPGROUPS = 1;
 static constexpr int NUM_PRODUCER_WARPGROUPS = 1;
-static constexpr int NUM_WARPS = (NUM_CONSUMER_WARPGROUPS + NUM_PRODUCER_WARPGROUPS) * 4;
+static constexpr int NUM_WARPS = (NUM_CONSUMER_WARPGROUPS + NUM_EPILOGUE_WARPGROUPS + NUM_PRODUCER_WARPGROUPS) * 4;
 static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
 
 struct matmul_globals {
@@ -42,66 +42,216 @@ struct matmul_globals {
     a_gl A;
     b_gl B;
     d_gl D;
-
-    __host__ __inline__ dim3 grid() { return dim3(D.rows()/BM * D.cols()/BN * CLUSTER_SIZE); }
+    int total_tiles;    // total number of cluster-sized tiles
+    int num_clusters;   // number of clusters in the grid (stride)
 };
 
+// Plan / Design Notes:
+//
+// Structure: same 3 warpgroups as Level 05 (producer/consumer/epilogue),
+// wrapped in a persistent outer task loop.
+//
+// Tile distribution (strided):
+//   - num_clusters = grid_size / CLUSTER_SIZE (= min(total_tiles, num_SMs/2))
+//   - Each cluster processes tiles: cluster_idx, cluster_idx + num_clusters,
+//     cluster_idx + 2*num_clusters, ... until >= total_tiles
+//   - Both CTAs compute the same tile coords from the same formula — no
+//     atomics, no DSMEM broadcast, no extra semaphores needed
+//
+// Semaphores (same as Level 05 plus one new one):
+//   - inputs_arrived[LOAD_PIPE_DEPTH], inputs_finished[LOAD_PIPE_DEPTH]: K-loop
+//   - outputs_arrived: consumer -> epilogue (MMA results ready in TMEM)
+//   - tmem_provisioned: epilogue -> consumer (TMEM allocated)
+//   - NEW: outputs_finished: epilogue -> producer (store done, TMEM safe to overwrite)
+//     * Producer waits on this before starting K-loop for next task (task_iter > 0)
+//     * Epilogue signals after TMA store completes
+//
+// Producer warpgroup (wg_id == 1):
+//   - Single TMA loader warp, task loop wrapping K-loop:
+//     for (tile = cluster_idx; tile < total_tiles; tile += num_clusters):
+//       if tile != cluster_idx: wait(outputs_finished) — previous store done
+//       compute cluster_row, cluster_col from tile
+//       K-loop: same as Level 05
+//
+// Consumer warpgroup (wg_id == 0):
+//   - Same as Level 05 but task loop wrapping K-loop
+//   - Each iteration: K-loop -> commit
+//
+// Epilogue warpgroup (wg_id == 2):
+//   - TMEM provision once (first iteration only)
+//   - Task loop:
+//     * wait(outputs_arrived) — MMA results ready
+//     * TMEM -> registers -> smem -> TMA store
+//     * Signal outputs_finished
+//   - TMEM deprovision after loop
+//
+// Bitfield phase tracking:
+//   - Phases keep advancing naturally across tasks — no reinit needed
+//   - outputs_arrived / outputs_finished use bitfield or simple phase tracking
+//
+// Host side:
+//   - total_tiles = (M/BM) * (N/BN)
+//   - num_clusters = min(total_tiles, num_SMs / CLUSTER_SIZE)
+//   - grid = num_clusters * CLUSTER_SIZE
+//   - LaunchConfig<true, false> (cluster=true, CLC=false)
+
 __global__ void kernel(const __grid_constant__ matmul_globals g) {
-    // TODO: Implement
-    //
-    // Key differences from Level 05:
-    //
-    // 1. New shared state:
-    //    __shared__ clc::handle clc_handle[CLC_PIPE_DEPTH];
-    //    __shared__ semaphore schedule_arrived[CLC_PIPE_DEPTH];
-    //    __shared__ semaphore schedule_finished[CLC_PIPE_DEPTH];
-    //    init schedule_finished with arrival count:
-    //        (2 + NUM_CONSUMERS) * CLUSTER_SIZE + NUM_CONSUMERS
-    //
-    // 2. Initial tile from blockIdx (first task only):
-    //    int2 tile_coord = {blockIdx.x / (CLUSTER_SIZE * (N/BN)),
-    //                       (blockIdx.x / CLUSTER_SIZE) % (N/BN)};
-    //    (or use a simple linear-to-2D mapping)
-    //
-    // 3. Producer warp 3 (TMA loader) — infinite loop:
-    //    for (task_iter = 0; true; task_iter++) {
-    //        // K-loop: same as Level 05
-    //        // After K-loop:
-    //        wait(schedule_arrived[task_iter % CLC_PIPE_DEPTH], ...);
-    //        auto schedule = clc::query(clc_handle[...]);
-    //        tma::cluster::arrive(schedule_finished[...], 0);
-    //        if (schedule.success) tile_coord = ...(schedule.x);
-    //        else break;
-    //    }
-    //
-    // 4. Producer warp 2 (CLC scheduler) — infinite loop:
-    //    for (task_iter = 0; true; task_iter++) {
-    //        if (cta_rank == 0) {
-    //            wait(schedule_finished[...], ...);
-    //            clc::schedule(clc_handle[...], schedule_arrived[...]);
-    //        }
-    //        tma::expect_bytes(schedule_arrived[...], sizeof(clc_handle[...]));
-    //        wait(schedule_arrived[...], ...);
-    //        auto schedule = clc::query(clc_handle[...]);
-    //        tma::cluster::arrive(schedule_finished[...], 0);
-    //        if (!schedule.success) break;
-    //    }
-    //
-    // 5. Consumer + Epilogue also wait on schedule_arrived and query schedule
-    //    to know when to break.
+    using G = matmul_globals;
+    if (threadIdx.x == 0) {
+        g.A.template prefetch_tma<typename G::a_tile>();
+        g.B.template prefetch_tma<typename G::b_tile>();
+        g.D.template prefetch_tma<typename G::d_tile>();
+    }
+    const int num_k_tiles   = g.A.cols() / BK;
+    const int num_col_tiles = g.D.cols() / BN;
+    const int cluster_start = blockIdx.x / CLUSTER_SIZE;
+    const int cta_rank      = cluster_ctarank();
+    const int wg_id         = warpgroup::groupid();
+
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+
+    typename G::a_tile (&a_smem)[LOAD_PIPE_DEPTH] = al.allocate<G::a_tile, LOAD_PIPE_DEPTH>();
+    typename G::b_tile (&b_smem)[LOAD_PIPE_DEPTH] = al.allocate<G::b_tile, LOAD_PIPE_DEPTH>();
+    typename G::d_tile (&d_smem) = al.allocate<G::d_tile>();
+
+    tensor_allocator<1, CLUSTER_SIZE, false> tm_alloc{};
+    using d_tt_t = tt<float, BM/CLUSTER_SIZE, BN>;
+
+    __shared__ uint32_t tmem_addr;
+    __shared__ semaphore tmem_provisioned;
+    __shared__ semaphore inputs_arrived[LOAD_PIPE_DEPTH], inputs_finished[LOAD_PIPE_DEPTH];
+    __shared__ semaphore outputs_arrived, outputs_finished;
+
+    const bool is_producer = (wg_id == 1);
+    const bool is_consumer = (wg_id == 0);
+
+    // Initialize all semaphores ONCE
+    if (threadIdx.x == 0) {
+        init_semaphore(tmem_provisioned, 0, 1);
+        #pragma unroll
+        for (int i = 0; i < LOAD_PIPE_DEPTH; i++) {
+            init_semaphore(inputs_arrived[i], 0, 1);
+            init_semaphore(inputs_finished[i], 0, 1);
+        }
+        init_semaphore(outputs_arrived, 0, 1);
+        init_semaphore(outputs_finished, 0, 1);
+    }
+    uint32_t bitfield = 0xFFFF0000;
+    everyone::tma::cluster::arrive_aligned();
+
+    // ===================== PRODUCER (warpgroup 1) =====================
+    if (wg_id == 1) {
+        warpgroup::decrease_registers<56>();
+        if (warpgroup::warpid() == 0 && warp::elect_leader()) {
+            everyone::tma::cluster::wait();
+            int input_ring = 0;
+            int outputs_finished_phase = 0;
+            for (int tile = cluster_start; tile < g.total_tiles; tile += g.num_clusters) {
+                // Wait for previous epilogue to finish reading TMEM (not first tile)
+                if (tile != cluster_start) {
+                    wait(outputs_finished, outputs_finished_phase);
+                    outputs_finished_phase ^= 1;
+                }
+                int cluster_row = tile / num_col_tiles;
+                int cluster_col = tile % num_col_tiles;
+                for (int k_iter = 0; k_iter < num_k_tiles; k_iter++) {
+                    wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
+                    tma::cluster::load_async(a_smem[input_ring], g.A, {0, 0, cluster_row*2 + cta_rank, k_iter}, inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    tma::cluster::load_async(b_smem[input_ring], g.B, {0, 0, cluster_col*2 + cta_rank, k_iter}, inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    update_phasebit<1>(bitfield, input_ring);
+                    input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
+                }
+            }
+        }
+    }
+    // ===================== CONSUMER (warpgroup 0) =====================
+    else if (wg_id == 0) {
+        if (cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
+            everyone::tma::cluster::wait();
+            wait(tmem_provisioned, 0);
+            tm_alloc.set_addr(tmem_addr);
+            d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
+
+            int input_ring = 0;
+            int outputs_finished_phase = 0;
+            for (int tile = cluster_start; tile < g.total_tiles; tile += g.num_clusters) {
+                // Wait for previous epilogue to finish reading TMEM (not first tile)
+                if (tile != cluster_start) {
+                    wait(outputs_finished, outputs_finished_phase);
+                    outputs_finished_phase ^= 1;
+                }
+                for (int k_iter = 0; k_iter < num_k_tiles; k_iter++) {
+                    tma::expect_bytes(inputs_arrived[input_ring],
+                        CLUSTER_SIZE * size_bytes<typeof(a_smem[0])> +
+                        CLUSTER_SIZE * size_bytes<typeof(b_smem[0])>);
+                    wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
+                    if (k_iter == 0) mm2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring], inputs_finished[input_ring]);
+                    else             mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring], inputs_finished[input_ring]);
+                    update_phasebit<0>(bitfield, input_ring);
+                    input_ring = ring_advance<LOAD_PIPE_DEPTH>(input_ring);
+                }
+                detail::tcgen05::commit<CLUSTER_SIZE>(outputs_arrived);
+            }
+        }
+    }
+    // ===================== EPILOGUE (warpgroup 2) =====================
+    else {
+        warpgroup::increase_registers<224>();
+        everyone::tma::cluster::wait_aligned();
+
+        // Provision TMEM once
+        if (warpgroup::warpid() == 0) {
+            tm_alloc.provision(tmem_addr);
+            warp::arrive(tmem_provisioned);
+        }
+        wait(tmem_provisioned, 0);
+        tm_alloc.set_addr(tmem_addr);
+        d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
+
+        int outputs_arrived_phase = 0;
+        for (int tile = cluster_start; tile < g.total_tiles; tile += g.num_clusters) {
+            int cluster_row = tile / num_col_tiles;
+            int cluster_col = tile % num_col_tiles;
+
+            wait(outputs_arrived, outputs_arrived_phase);
+            outputs_arrived_phase ^= 1;
+
+            rt_bf<BM/CLUSTER_SIZE/4, BN> d_reg;
+            warpgroup::load_async(d_reg, d_tt);
+            tensor_load_wait();
+            if (warpgroup::warpid() == 0) warp::arrive(outputs_finished);  // TMEM is free for next tile's MMA
+            warpgroup::store(d_smem, d_reg);
+            warpgroup::sync(1);
+            if (warpgroup::laneid() == 0) {
+                tma::store_async(g.D, d_smem, {0, 0, cluster_row*2 + cta_rank, cluster_col});
+                tma::store_async_read_wait();
+            }
+            warpgroup::sync(1);
+        }
+
+        // Deprovision TMEM once
+        if (warpgroup::warpid() == 0) tm_alloc.deprovision();
+    }
 }
 
 void matmul(bf16* A, bf16* B, bf16* C, size_t M, size_t N, size_t K) {
-    matmul_globals::a_gl a_arg{A, nullptr, nullptr, (int)M, (int)K};
-    matmul_globals::b_gl b_arg{B, nullptr, nullptr, (int)N, (int)K};
-    matmul_globals::d_gl d_arg{C, nullptr, nullptr, (int)M, (int)N};
-    matmul_globals g{a_arg, b_arg, d_arg};
+    matmul_globals::a_gl a_arg{A, nullptr, nullptr, M, K};
+    matmul_globals::b_gl b_arg{B, nullptr, nullptr, N, K};
+    matmul_globals::d_gl d_arg{C, nullptr, nullptr, M, N};
 
+    int total_tiles = (M / BM) * (N / BN);
+    int num_sms = 148;  // B200
+    int num_clusters = min(total_tiles, num_sms / (int)CLUSTER_SIZE);
+
+    matmul_globals g{a_arg, b_arg, d_arg, total_tiles, num_clusters};
+
+    dim3 grid(num_clusters * CLUSTER_SIZE);
+    dim3 block(NUM_THREADS);
     unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
-    // CLC + PDL enabled launch
-    LaunchConfig<true, true> launch_config(g.grid(), dim3(NUM_THREADS), mem_size, 0, CLUSTER_SIZE);
+    LaunchConfig<true, false> launch_config(grid, block, mem_size, 0, CLUSTER_SIZE);
     cudaLaunchKernelEx(launch_config, kernel, g);
 }
 
