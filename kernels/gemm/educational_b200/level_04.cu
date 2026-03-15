@@ -74,11 +74,12 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     using d_tt_t = tt<float, BM/CLUSTER_SIZE, BN>;
 
     __shared__ uint32_t tmem_addr;
-    __shared__ semaphore tmem_provisioned;
+    __shared__ semaphore tmem_provisioned, tmem_finished;
     __shared__ semaphore inputs_arrived[LOAD_PIPE_DEPTH], inputs_finished[LOAD_PIPE_DEPTH], outputs_arrived;
 
     if (threadIdx.x == 0) {
         init_semaphore(tmem_provisioned, 0, 1);
+        init_semaphore(tmem_finished, 0, 1);
         for(int i = 0; i < LOAD_PIPE_DEPTH; i++) {
             init_semaphore(inputs_arrived[i], 0, 1);   // 1 TMA transaction group
             init_semaphore(inputs_finished[i], 0, 1);  // 1 MMA signals done reading smem
@@ -161,9 +162,13 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
             tma::store_async_read_wait();
         }
 
-        // Free TMEM (entire warp must participate)
+        // Sync both CTAs before deprovision (cluster-scope operation)
         warpgroup::sync(1);
-        if (warpgroup::warpid() == 0) tm_alloc.deprovision();
+        if (warpgroup::warpid() == 0) {
+            if (warp::elect_leader()) tma::cluster::arrive(tmem_finished, 1-cta_rank);
+            wait(tmem_finished, 0);
+            tm_alloc.deprovision();
+        }
     }
 }
 

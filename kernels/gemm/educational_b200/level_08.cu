@@ -95,13 +95,14 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     using d_tt_chunk_t = tt<float, BM/CLUSTER_SIZE, BN/EPI_PIPE_DEPTH>;
 
     __shared__ uint32_t tmem_addr;
-    __shared__ semaphore tmem_provisioned;
+    __shared__ semaphore tmem_provisioned, tmem_finished;
     __shared__ semaphore inputs_arrived[LOAD_PIPE_DEPTH], inputs_finished[LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived[MMA_PIPE_DEPTH], outputs_finished[MMA_PIPE_DEPTH];
 
     // Initialize all semaphores ONCE
     if (threadIdx.x == 0) {
         init_semaphore(tmem_provisioned, 0, 1);
+        init_semaphore(tmem_finished, 0, 1);
         #pragma unroll
         for (int i = 0; i < LOAD_PIPE_DEPTH; i++) {
             init_semaphore(inputs_arrived[i], 0, 1);
@@ -211,8 +212,12 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
             }
         }
 
-        // Deprovision TMEM once
-        if (warpgroup::warpid() == 0) tm_alloc.deprovision();
+        // Sync both CTAs before deprovision (cluster-scope operation)
+        if (warpgroup::warpid() == 0) {
+            if (warp::elect_leader()) tma::cluster::arrive(tmem_finished, 1-cta_rank);
+            wait(tmem_finished, 0);
+            tm_alloc.deprovision();
+        }
     }
 }
 
