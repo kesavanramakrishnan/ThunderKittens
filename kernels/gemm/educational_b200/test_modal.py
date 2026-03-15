@@ -60,25 +60,58 @@ def build_and_run(level: str, workdir: str):
 
 
 def parse_results(output):
-    """Parse benchmark output into list of (M, N, K, tflops, time_us) tuples."""
+    """Parse benchmark output into list of result dicts."""
     results = []
     lines = output.strip().split("\n")
     current_m, current_n, current_k = None, None, None
-    time_us = None
+    tk_us, tk_tflops = None, None
+    cublas_us, cublas_tflops = None, None
     for line in lines:
         m = re.search(r"M=(\d+)\s+N=(\d+)\s+K=(\d+)", line)
         if m:
+            # Emit previous block if it had TK data but no cuBLAS
+            if current_m is not None and tk_tflops is not None:
+                results.append({
+                    "M": current_m, "N": current_n, "K": current_k,
+                    "tk_us": tk_us, "tk_tflops": tk_tflops,
+                    "cublas_us": cublas_us, "cublas_tflops": cublas_tflops,
+                })
             current_m = int(m.group(1))
             current_n = int(m.group(2))
             current_k = int(m.group(3))
-        t = re.search(r"Average kernel execution time:\s+([\d.]+)\s+us", line)
+            tk_us = tk_tflops = cublas_us = cublas_tflops = None
+        # New format: "TK kernel:   91.07 us  (1509.1 TFLOPs)"
+        t = re.search(r"TK kernel:\s+([\d.]+)\s+us\s+\(([\d.]+)\s+TFLOPs\)", line)
         if t and current_m is not None:
-            time_us = float(t.group(1))
-        p = re.search(r"Achieved performance:\s+([\d.]+)\s+TFLOPs", line)
-        if p and current_m is not None:
-            tflops = float(p.group(1))
-            results.append((current_m, current_n, current_k, tflops, time_us))
+            tk_us = float(t.group(1))
+            tk_tflops = float(t.group(2))
+        # New format: "cuBLAS:      95.2 us  (1443.5 TFLOPs)"
+        c = re.search(r"cuBLAS:\s+([\d.]+)\s+us\s+\(([\d.]+)\s+TFLOPs\)", line)
+        if c and current_m is not None:
+            cublas_us = float(c.group(1))
+            cublas_tflops = float(c.group(2))
+        # Old format fallback: "Average kernel execution time: 91.07 us"
+        t_old = re.search(r"Average kernel execution time:\s+([\d.]+)\s+us", line)
+        if t_old and current_m is not None and tk_us is None:
+            tk_us = float(t_old.group(1))
+        p_old = re.search(r"Achieved performance:\s+([\d.]+)\s+TFLOPs", line)
+        if p_old and current_m is not None and tk_tflops is None:
+            tk_tflops = float(p_old.group(1))
+        # Emit result when we have TK data and either cuBLAS or end of block
+        if tk_tflops is not None and cublas_tflops is not None and current_m is not None:
+            results.append({
+                "M": current_m, "N": current_n, "K": current_k,
+                "tk_us": tk_us, "tk_tflops": tk_tflops,
+                "cublas_us": cublas_us, "cublas_tflops": cublas_tflops,
+            })
             current_m = None
+    # Handle case where cuBLAS is not present (old levels)
+    if current_m is not None and tk_tflops is not None:
+        results.append({
+            "M": current_m, "N": current_n, "K": current_k,
+            "tk_us": tk_us, "tk_tflops": tk_tflops,
+            "cublas_us": cublas_us, "cublas_tflops": cublas_tflops,
+        })
     return results
 
 
@@ -102,8 +135,12 @@ def run_level(level: str):
 
     # Summary
     print(f"\n--- Level {level} Summary ---")
-    for m, n, k, tflops, t_us in results:
-        print(f"  {m}x{n}x{k}: {tflops:.2f} TFLOPs ({t_us:.1f} us)")
+    for r in results:
+        line = f"  {r['M']}x{r['N']}x{r['K']}: TK {r['tk_tflops']:.2f} TFLOPs ({r['tk_us']:.1f} us)"
+        if r.get('cublas_tflops'):
+            pct = r['tk_tflops'] / r['cublas_tflops'] * 100
+            line += f"  |  cuBLAS {r['cublas_tflops']:.2f} TFLOPs  |  TK/cuBLAS {pct:.1f}%"
+        print(line)
 
     return {"level": level, "status": "ok", "results": results}
 
@@ -138,17 +175,21 @@ def run_all_levels(levels: list[str]):
     # Collect all problem sizes
     all_sizes = set()
     for results in all_results.values():
-        for m, n, k, _, _ in results:
-            all_sizes.add((m, n, k))
+        for r in results:
+            all_sizes.add((r['M'], r['N'], r['K']))
 
     for size in sorted(all_sizes):
         m, n, k = size
         print(f"\n  {m}x{n}x{k}:")
         for level in levels:
             results = all_results.get(level, [])
-            for rm, rn, rk, tflops, t_us in results:
-                if (rm, rn, rk) == size:
-                    print(f"    Level {level}: {tflops:8.2f} TFLOPs  ({t_us:.1f} us)")
+            for r in results:
+                if (r['M'], r['N'], r['K']) == size:
+                    line = f"    Level {level}: {r['tk_tflops']:8.2f} TFLOPs  ({r['tk_us']:.1f} us)"
+                    if r.get('cublas_tflops'):
+                        pct = r['tk_tflops'] / r['cublas_tflops'] * 100
+                        line += f"  [{pct:.1f}% of cuBLAS]"
+                    print(line)
                     break
 
     return all_results
