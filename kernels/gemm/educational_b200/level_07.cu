@@ -114,7 +114,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     everyone::tma::cluster::arrive_aligned();
 
     // ===================== PRODUCER (warpgroup 1) =====================
-    // Identical to Level 06 — epilogue pipelining doesn't affect the producer.
     if (wg_id == 1) {
         warpgroup::decrease_registers<56>();
         if (warpgroup::warpid() == 0 && warp::elect_leader()) {
@@ -139,7 +138,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         }
     }
     // ===================== CONSUMER (warpgroup 0) =====================
-    // Identical to Level 06 — one TMEM accumulator, same K-loop.
     else if (wg_id == 0) {
         if (cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
             everyone::tma::cluster::wait();
@@ -169,8 +167,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         }
     }
     // ===================== EPILOGUE (warpgroup 2) =====================
-    // NEW: instead of loading the entire 128×128 at once, read EPI_PIPE_DEPTH
-    // chunks of 128×(128/EPI_PIPE_DEPTH) using subtile, double-buffering SMEM.
     else {
         warpgroup::increase_registers<224>();
         everyone::tma::cluster::wait_aligned();

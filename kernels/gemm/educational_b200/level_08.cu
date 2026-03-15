@@ -34,7 +34,7 @@
 //   Tile 2: wait(outputs_finished[0]), MMA → d_tt[0]
 //           Epilogue reads d_tt[1], signals outputs_finished[1]
 //
-// Tile: 256x128 output per cluster, CLUSTER_SIZE=2
+// Tile: 256x256 output per cluster, CLUSTER_SIZE=2
 // Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
 
 #include "kittens.cuh"
@@ -71,49 +71,6 @@ struct matmul_globals {
 };
 
 __global__ void kernel(const __grid_constant__ matmul_globals g) {
-    // TODO: Implement
-    //
-    // Same structure as Level 07 (3 warpgroups, persistent strided loop,
-    // epilogue pipelining), but now with MMA_PIPE_DEPTH=2 accumulators.
-    //
-    // Key differences from Level 07:
-    //
-    // 1. TMEM: allocate MMA_PIPE_DEPTH accumulators at different offsets:
-    //    d_tt_t d_tt[MMA_PIPE_DEPTH];
-    //    d_tt[0] = tm_alloc.allocate<d_tt_t>(0 * BN);
-    //    d_tt[1] = tm_alloc.allocate<d_tt_t>(1 * BN);
-    //
-    // 2. Semaphores:
-    //    outputs_arrived[MMA_PIPE_DEPTH] — one per accumulator
-    //    outputs_finished[MMA_PIPE_DEPTH] — one per accumulator
-    //    init_semaphore(outputs_finished[i], 0, CLUSTER_SIZE);
-    //      (CLUSTER_SIZE because both CTAs' epilogues signal independently)
-    //
-    // 3. Producer:
-    //    - Tracks mma_ring = 0 (indexes into MMA_PIPE_DEPTH)
-    //    - wait(outputs_finished[mma_ring], get_phasebit<1>(bitfield, mma_ring))
-    //      (first MMA_PIPE_DEPTH tiles pass immediately)
-    //    - After K-loop: update_phasebit<1>(bitfield, mma_ring)
-    //    - mma_ring = ring_advance<MMA_PIPE_DEPTH>(mma_ring)
-    //
-    // 4. Consumer:
-    //    - Same mma_ring tracking
-    //    - wait(outputs_finished[mma_ring], ...) before MMA
-    //    - MMA into d_tt[mma_ring]
-    //    - commit(outputs_arrived[mma_ring]) after K-loop
-    //    - update_phasebit + advance mma_ring
-    //
-    // 5. Epilogue:
-    //    - Tracks mma_ring for which accumulator to read
-    //    - wait(outputs_arrived[mma_ring], ...) 
-    //    - Chunked read from d_tt[mma_ring] via subtile (same as Level 07)
-    //    - Signal outputs_finished[mma_ring] after last chunk
-    //    - Advance mma_ring
-    //
-    // The key insight: with MMA_PIPE_DEPTH=2, the consumer can start
-    // MMA for tile N+1 into d_tt[1] immediately after committing tile N
-    // into d_tt[0], without waiting for the epilogue to finish reading
-    // d_tt[0]. The wait only happens when wrapping back to d_tt[0].
     using G = matmul_globals;
     if (threadIdx.x == 0) {
         g.A.template prefetch_tma<typename G::a_tile>();
@@ -160,7 +117,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     everyone::tma::cluster::arrive_aligned();
 
     // ===================== PRODUCER (warpgroup 1) =====================
-    // Identical to Level 06 — epilogue pipelining doesn't affect the producer.
     if (wg_id == 1) {
         warpgroup::decrease_registers<56>();
         if (warpgroup::warpid() == 0 && warp::elect_leader()) {
@@ -183,7 +139,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         }
     }
     // ===================== CONSUMER (warpgroup 0) =====================
-    // Identical to Level 06 — one TMEM accumulator, same K-loop.
     else if (wg_id == 0) {
         if (cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
             everyone::tma::cluster::wait();
@@ -215,8 +170,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         }
     }
     // ===================== EPILOGUE (warpgroup 2) =====================
-    // NEW: instead of loading the entire 128×128 at once, read EPI_PIPE_DEPTH
-    // chunks of 128×(128/EPI_PIPE_DEPTH) using subtile, double-buffering SMEM.
     else {
         warpgroup::increase_registers<224>();
         everyone::tma::cluster::wait_aligned();

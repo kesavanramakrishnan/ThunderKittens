@@ -46,55 +46,6 @@ struct matmul_globals {
     int num_clusters;   // number of clusters in the grid (stride)
 };
 
-// Plan / Design Notes:
-//
-// Structure: same 3 warpgroups as Level 05 (producer/consumer/epilogue),
-// wrapped in a persistent outer task loop.
-//
-// Tile distribution (strided):
-//   - num_clusters = grid_size / CLUSTER_SIZE (= min(total_tiles, num_SMs/2))
-//   - Each cluster processes tiles: cluster_idx, cluster_idx + num_clusters,
-//     cluster_idx + 2*num_clusters, ... until >= total_tiles
-//   - Both CTAs compute the same tile coords from the same formula — no
-//     atomics, no DSMEM broadcast, no extra semaphores needed
-//
-// Semaphores (same as Level 05 plus one new one):
-//   - inputs_arrived[LOAD_PIPE_DEPTH], inputs_finished[LOAD_PIPE_DEPTH]: K-loop
-//   - outputs_arrived: consumer -> epilogue (MMA results ready in TMEM)
-//   - tmem_provisioned: epilogue -> consumer (TMEM allocated)
-//   - NEW: outputs_finished: epilogue -> producer (store done, TMEM safe to overwrite)
-//     * Producer waits on this before starting K-loop for next task (task_iter > 0)
-//     * Epilogue signals after TMA store completes
-//
-// Producer warpgroup (wg_id == 1):
-//   - Single TMA loader warp, task loop wrapping K-loop:
-//     for (tile = cluster_idx; tile < total_tiles; tile += num_clusters):
-//       if tile != cluster_idx: wait(outputs_finished) — previous store done
-//       compute cluster_row, cluster_col from tile
-//       K-loop: same as Level 05
-//
-// Consumer warpgroup (wg_id == 0):
-//   - Same as Level 05 but task loop wrapping K-loop
-//   - Each iteration: K-loop -> commit
-//
-// Epilogue warpgroup (wg_id == 2):
-//   - TMEM provision once (first iteration only)
-//   - Task loop:
-//     * wait(outputs_arrived) — MMA results ready
-//     * TMEM -> registers -> smem -> TMA store
-//     * Signal outputs_finished
-//   - TMEM deprovision after loop
-//
-// Bitfield phase tracking:
-//   - Phases keep advancing naturally across tasks — no reinit needed
-//   - outputs_arrived / outputs_finished use bitfield or simple phase tracking
-//
-// Host side:
-//   - total_tiles = (M/BM) * (N/BN)
-//   - num_clusters = min(total_tiles, num_SMs / CLUSTER_SIZE)
-//   - grid = num_clusters * CLUSTER_SIZE
-//   - LaunchConfig<true, false> (cluster=true, CLC=false)
-
 __global__ void kernel(const __grid_constant__ matmul_globals g) {
     using G = matmul_globals;
     if (threadIdx.x == 0) {

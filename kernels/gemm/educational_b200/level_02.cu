@@ -38,16 +38,6 @@ struct matmul_globals {
 };
 
 __global__ void kernel(const __grid_constant__ matmul_globals g) {
-    // TODO: Implement
-    //
-    // Key differences from Level 01:
-    //
-    // 1. TMEM allocation:
-    //    tensor_allocator<1, 1, false> tm_alloc{};
-    //    using d_tt_t = tt<float, BM, BN>;  // accumulator in TMEM
-    //    __shared__ uint32_t tmem_addr;
-    //    __shared__ semaphore tmem_provisioned;
-
     using G = matmul_globals;
     // Prefetch TMA descriptors
     if (threadIdx.x == 0) {

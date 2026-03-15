@@ -9,7 +9,7 @@
 //   - CLC dynamically assigns tiles to clusters as they become available
 //   - CLC handles the "persistent kernel" pattern in hardware, so we don't
 //     need to manage a global atomic counter or stride calculation
-//   - CLC also enables dependent kernel launches (pdl) for back-to-back GEMMs
+//   - CLC also enables dependent kernel launches for back-to-back matmuls
 //
 // New concepts (vs Level 08):
 //   - clc::handle: shared memory object that receives scheduling info from HW
@@ -21,9 +21,6 @@
 //     * Arrival count = (2 + NUM_CONSUMER_WARPGROUPS) * CLUSTER_SIZE + NUM_CONSUMER_WARPGROUPS
 //       because producer (2 warps: loader + scheduler), consumer(s), and
 //       epilogue all need to acknowledge the schedule
-//   - pdl::wait() / warpgroup::pdl::arrive(): dependent launch chaining
-//     * pdl::wait() at kernel start — waits for previous kernel to finish
-//     * pdl::arrive() at epilogue end — signals that this kernel is finishing
 //   - LaunchConfig<true, true>: cluster=true, CLC=true
 //   - Grid size = total_tiles * CLUSTER_SIZE (HW schedules all tiles)
 //
@@ -42,13 +39,11 @@
 // Consumer and epilogue also participate in CLC protocol:
 //   - Both wait on schedule_arrived to get tile index
 //   - Both signal schedule_finished after reading the handle
-//   - Epilogue calls warpgroup::pdl::arrive() on the last task
-//
 // Key structural change: the task loop is now `for (task_iter = 0; true; ...)`
 // with a `break` when `!schedule.success`, instead of iterating over a
 // known tile count with stride.
 //
-// Tile: 256x128 output per cluster, CLUSTER_SIZE=2
+// Tile: 256x256 output per cluster, CLUSTER_SIZE=2
 // Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
 
 #include "kittens.cuh"
@@ -139,8 +134,7 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     everyone::tma::cluster::arrive_aligned();
 
     // ===================== PRODUCER (warpgroup 1) =====================
-    // Identical to Level 06 — epilogue pipelining doesn't affect the producer.
-    if (wg_id == 1) {        
+    if (wg_id == 1) {
         warpgroup::decrease_registers<56>();
 
         if (warpgroup::warpid() == 3 && warp::elect_leader()) {
@@ -179,7 +173,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         }
     }
     // ===================== CONSUMER (warpgroup 0) =====================
-    // Identical to Level 06 — one TMEM accumulator, same K-loop.
     else if (wg_id == 0) {
         if (cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
             everyone::tma::cluster::wait();
@@ -213,8 +206,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         }
     }
     // ===================== EPILOGUE (warpgroup 2) =====================
-    // NEW: instead of loading the entire 128×128 at once, read EPI_PIPE_DEPTH
-    // chunks of 128×(128/EPI_PIPE_DEPTH) using subtile, double-buffering SMEM.
     else {
         warpgroup::increase_registers<224>();
         everyone::tma::cluster::wait_aligned();
@@ -266,58 +257,6 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         // Deprovision TMEM once
         if (warpgroup::warpid() == 0) tm_alloc.deprovision();
     }
-    // TODO: Implement
-    //
-    // Structure: same 3 warpgroups + MMA_PIPE_DEPTH + EPI_PIPE_DEPTH,
-    // but the task loop is now driven by CLC instead of a strided index.
-    //
-    // Key differences from Level 08:
-    //
-    // 1. New shared memory objects:
-    //    __shared__ clc::handle clc_handle[CLC_PIPE_DEPTH];
-    //    __shared__ semaphore schedule_arrived[CLC_PIPE_DEPTH];
-    //    __shared__ semaphore schedule_finished[CLC_PIPE_DEPTH];
-    //
-    // 2. Semaphore init:
-    //    init_semaphore(schedule_arrived[i], 0, 1);
-    //    init_semaphore(schedule_finished[i], 0,
-    //        (2 + NUM_CONSUMER_WARPGROUPS) * CLUSTER_SIZE + NUM_CONSUMER_WARPGROUPS);
-    //
-    // 3. Producer warp 3 (TMA loader):
-    //    Initial tile_coord from blockIdx.x / CLUSTER_SIZE
-    //    for (task_iter = 0; true; task_iter++):
-    //      K-loop with tile_coord (same as Level 08)
-    //      wait(schedule_arrived[task_iter % CLC_PIPE_DEPTH], phase)
-    //      schedule = clc::query(clc_handle[task_iter % CLC_PIPE_DEPTH])
-    //      tma::cluster::arrive(schedule_finished[...], 0)
-    //      if (schedule.success) tile_coord = ... from schedule.x
-    //      else break
-    //
-    // 4. Producer warp 2 (CLC scheduler):
-    //    for (task_iter = 0; true; task_iter++):
-    //      if (cta_rank == 0):
-    //        wait(schedule_finished[...], phase)  // previous task acknowledged
-    //        clc::schedule(clc_handle[...], schedule_arrived[...])
-    //      tma::expect_bytes(schedule_arrived[...], sizeof(clc_handle[...]))
-    //      wait(schedule_arrived[...], phase)
-    //      schedule = clc::query(clc_handle[...])
-    //      tma::cluster::arrive(schedule_finished[...], 0)
-    //      if (!schedule.success) break
-    //
-    // 5. Consumer also participates in CLC protocol:
-    //    - wait on schedule_arrived, query handle, signal schedule_finished
-    //    - Break when !schedule.success
-    //    - MMA into d_tt[task_iter % MMA_PIPE_DEPTH] (same as Level 08)
-    //
-    // 6. Epilogue also participates in CLC protocol:
-    //    - wait on schedule_arrived, query handle, signal schedule_finished
-    //    - On last task (!schedule.success): warpgroup::pdl::arrive()
-    //    - Chunked read from d_tt[task_iter % MMA_PIPE_DEPTH] (same as Level 08)
-    //
-    // 7. Grid = total_tiles * CLUSTER_SIZE (HW manages scheduling)
-    //    LaunchConfig<true, true> — CLC enabled
-    //
-    // 8. No more total_tiles/num_clusters in globals — not needed with CLC
 }
 
 void matmul(bf16* A, bf16* B, bf16* C, size_t M, size_t N, size_t K) {

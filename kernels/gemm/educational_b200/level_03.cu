@@ -42,13 +42,6 @@ struct matmul_globals {
 };
 
 __global__ void kernel(const __grid_constant__ matmul_globals g) {
-    // TODO: Implement
-    //
-    // Key differences from Level 02:
-    //
-    // 1. Cluster identification:
-    //    const int cta_rank = cluster_ctarank();  // 0 or 1
-
     using G = matmul_globals;
     // Prefetch TMA descriptors
     if (threadIdx.x == 0) {

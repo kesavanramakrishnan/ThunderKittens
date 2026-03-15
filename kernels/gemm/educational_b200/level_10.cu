@@ -1,6 +1,6 @@
 // Level 10: Full Production Kernel
 // ====================================
-// The complete optimized B200 GEMM kernel matching bf16_b200_gemm.cu.
+// The complete optimized B200 matmul kernel matching bf16_b200_gemm.cu.
 // Adds supergroup swizzling, OVERLAP_MMA_EPI mode, configurable template
 // parameters, and NUM_CONSUMERS=2 non-overlap mode.
 //
@@ -47,7 +47,7 @@
 //   - Allocated at different TMEM offsets:
 //     (i + warpgroup_id) * Nb for Mb=256
 //
-// This is equivalent to bf16_b200_gemm.cu — the production kernel.
+// This is equivalent to bf16_b200_gemm.cu — the production matmul kernel.
 //
 // Tile: 256xNb output per cluster, CLUSTER_SIZE=2, fully parameterized
 // Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T

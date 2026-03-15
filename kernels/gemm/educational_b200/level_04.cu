@@ -1,17 +1,17 @@
-// Level 04: Separate Epilogue Warpgroup
-// =======================================
+// Level 04: Separate Epilogue Warpgroup + Double Buffering
+// ==========================================================
 // Split the CTA into 3 roles: producer (loads), consumer (MMA), epilogue (stores).
 // The consumer writes MMA results to TMEM, the epilogue reads TMEM and stores to
-// global memory. This allows overlapping the next task's MMA with the current store.
+// global memory. This decouples MMA from stores.
 //
-// New concepts:
+// New concepts (vs Level 03):
 //   - 3 warpgroups: producer (loads), consumer (MMA), epilogue (stores)
+//   - LOAD_PIPE_DEPTH=2 double-buffered input tiles
 //   - outputs_arrived: consumer signals epilogue that TMEM accumulator is ready
-//   - outputs_finished: epilogue signals consumer that TMEM buffer is free to reuse
-//   - warpgroup::load_async from TMEM subtile into registers
-//   - warpgroup::store from registers to SMEM
-//   - warpgroup::tma::store_async from SMEM to global
+//   - tmem_provisioned: epilogue signals consumer that TMEM is allocated
 //   - increase_registers / decrease_registers for register budget balancing
+//   - warpgroup::load_async from TMEM into registers
+//   - warpgroup::store from registers to SMEM, then TMA store to global
 //
 // Tile: 256x128 output per cluster (128 rows per CTA), CLUSTER_SIZE=2
 // Layout: A is (M, K) row-major, B is (N, K) row-major, D = A * B^T
@@ -22,7 +22,7 @@ using namespace kittens;
 static constexpr int BM = 256;
 static constexpr int BN = 128;
 static constexpr int BK = 64;
-static constexpr int QSIZE = 2;
+static constexpr int LOAD_PIPE_DEPTH = 2;
 static constexpr int CLUSTER_SIZE = 2;
 
 static constexpr int NUM_CONSUMER_WARPGROUPS = 1;  // MMA only
@@ -44,9 +44,6 @@ struct matmul_globals {
 };
 
 __global__ void kernel(const __grid_constant__ matmul_globals g) {
-    // TODO: Implement
-    //
-
     using G = matmul_globals;
     // Prefetch TMA descriptors
     if (threadIdx.x == 0) {
@@ -68,8 +65,8 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
 
-    typename G::a_tile (&a_smem)[QSIZE] = al.allocate<G::a_tile, QSIZE>();
-    typename G::b_tile (&b_smem)[QSIZE] = al.allocate<G::b_tile, QSIZE>();
+    typename G::a_tile (&a_smem)[LOAD_PIPE_DEPTH] = al.allocate<G::a_tile, LOAD_PIPE_DEPTH>();
+    typename G::b_tile (&b_smem)[LOAD_PIPE_DEPTH] = al.allocate<G::b_tile, LOAD_PIPE_DEPTH>();
     typename G::d_tile (&d_smem) = al.allocate<G::d_tile>();
 
 
@@ -78,12 +75,11 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
 
     __shared__ uint32_t tmem_addr;
     __shared__ semaphore tmem_provisioned;
-    __shared__ semaphore inputs_arrived[QSIZE], inputs_finished[QSIZE], outputs_arrived;
+    __shared__ semaphore inputs_arrived[LOAD_PIPE_DEPTH], inputs_finished[LOAD_PIPE_DEPTH], outputs_arrived;
 
-    // Initialize semaphores (single thread)
     if (threadIdx.x == 0) {
         init_semaphore(tmem_provisioned, 0, 1);
-        for(int i = 0; i < QSIZE; i++) {
+        for(int i = 0; i < LOAD_PIPE_DEPTH; i++) {
             init_semaphore(inputs_arrived[i], 0, 1);   // 1 TMA transaction group
             init_semaphore(inputs_finished[i], 0, 1);  // 1 MMA signals done reading smem
         }
@@ -99,10 +95,9 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
         if (warpgroup::warpid() == 0 && warp::elect_leader()) {
             everyone::tma::cluster::wait();  // wait for semaphore init
             for (int k_iter = 0; k_iter < num_k_tiles; k_iter++) {
-                int q = k_iter % QSIZE;
-                // Wait for consumer to finish reading this buffer (skip first fill)
-                if (k_iter >= QSIZE) {
-                    wait(inputs_finished[q], (k_iter / QSIZE) - 1);
+                int q = k_iter % LOAD_PIPE_DEPTH;
+                if (k_iter >= LOAD_PIPE_DEPTH) {
+                    wait(inputs_finished[q], (k_iter / LOAD_PIPE_DEPTH) - 1);
                 }
                 if (cta_rank == 0) {
                     tma::expect_bytes(
@@ -127,8 +122,8 @@ __global__ void kernel(const __grid_constant__ matmul_globals g) {
             d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(0);
 
             for (int k_iter = 0; k_iter < num_k_tiles; k_iter++) {
-                int q = k_iter % QSIZE;
-                wait(inputs_arrived[q], k_iter / QSIZE);
+                int q = k_iter % LOAD_PIPE_DEPTH;
+                wait(inputs_arrived[q], k_iter / LOAD_PIPE_DEPTH);
                     if (k_iter == 0) mm2_ABt(d_tt, a_smem[q], b_smem[q], inputs_finished[q]);
                     else             mma2_ABt(d_tt, a_smem[q], b_smem[q], inputs_finished[q]);
             }
