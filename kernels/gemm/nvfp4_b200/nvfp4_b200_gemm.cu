@@ -120,15 +120,15 @@ __device__ inline void kernel(const globals<C> &g) {
 
     // Set up mbarriers
     __shared__ uint32_t tmem_addr;
-    __shared__ semaphore tmem_provisioned;
+    __shared__ semaphore tmem_provisioned, tmem_finished;
     __shared__ semaphore tiles_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore scales_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
-    __shared__ semaphore tmem_dealloc_ready;
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
+        init_semaphore(tmem_finished, 0, 1);
         #pragma unroll
         for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
             init_semaphore(tiles_arrived[i], 0, 1);
@@ -137,7 +137,6 @@ __device__ inline void kernel(const globals<C> &g) {
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
-        init_semaphore(tmem_dealloc_ready, 0, C::CLUSTER_SIZE);
     }
     everyone::tma::cluster::arrive_aligned();
 
@@ -300,9 +299,8 @@ __device__ inline void kernel(const globals<C> &g) {
         warpgroup::sync(1);
         warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) {
-            warpgroup::tma::cluster::arrive(tmem_dealloc_ready, 0, 1);
-            warpgroup::tma::cluster::arrive(tmem_dealloc_ready, 1, 1);
-            tma::cluster::wait(tmem_dealloc_ready, 0);
+            if (warp::elect_leader()) tma::cluster::arrive(tmem_finished, 1-cta_id);
+            wait(tmem_finished, 0);
             tm_allocator.deprovision();
         }
     }
@@ -673,17 +671,16 @@ __host__ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
     LaunchConfig<true, true> launch_config(g[0].grid(), g[0].block(), g[0].dynamic_shared_memory(), 0, C::CLUSTER_SIZE);
 
     // Number of iterations
-    int num_warmups = ncu ? 0 : 500;
-    int num_iters = ncu ? 1 : 100;
+    int num_warmups = ncu ? 0 : 5;
+    int num_iters = ncu ? 1 : 10;
 
-    // Warmup (reach power-steady state)
+    // Warmup
     for (int i = 0; i < num_warmups; i++) {
         int idx = i % arg_group_count;
         cudaLaunchKernelEx(launch_config, kernel_entrypoint<C>, g[idx]);
     }
-    cudaDeviceSynchronize();
 
-    // Benchmark (back-to-back, 2 events)
+    // Benchmark
     cudaEvent_t start, stop;
     CUDACHECK(cudaEventCreate(&start));
     CUDACHECK(cudaEventCreate(&stop));
