@@ -121,7 +121,7 @@ def parse_results(output):
     timeout=1800,
 )
 def run_level(level: str):
-    workdir = "/root/ThunderKittens/kernels/gemm/educational_b200"
+    workdir = "/root/ThunderKittens/kernels/gemm/kesavan_education_b200"
     print(f"\n{'='*60}")
     print(f"  LEVEL {level}")
     print(f"{'='*60}")
@@ -151,7 +151,7 @@ def run_level(level: str):
     timeout=3600,
 )
 def run_all_levels(levels: list[str]):
-    workdir = "/root/ThunderKittens/kernels/gemm/educational_b200"
+    workdir = "/root/ThunderKittens/kernels/gemm/kesavan_education_b200"
     all_results = {}
 
     for level in levels:
